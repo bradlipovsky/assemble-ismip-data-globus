@@ -16,21 +16,11 @@
   },
   "subset": {
     "variable": "tas",
-    "points": [
-      {
-        "name": "example_point_1",
-        "x": 0.0,
-        "y": 0.0
-      },
-      {
-        "name": "example_point_2",
-        "x": 200000.0,
-        "y": -300000.0
-      }
-    ]
+    "points_file": "./points/temperature_points.json"
   },
   "output": {
     "path": "./output/ismip7_tas_point_subset.nc",
+    "json_path": "./output/ismip7_tas_point_subset.json",
     "overwrite": false
   },
   "transfer": {

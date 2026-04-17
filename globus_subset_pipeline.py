@@ -3,27 +3,40 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import json
-import shutil
+import re
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import globus_sdk
-import h5netcdf
 import h5py
 import numpy as np
 from globus_sdk import GlobusAppConfig
 from globus_sdk.scopes import TransferScopes
+from pyproj import Transformer
+
+try:
+    import h5netcdf
+except ImportError:  # pragma: no cover - exercised only in lighter local setups
+    h5netcdf = None
 
 
 TUTORIAL_NATIVE_APP_CLIENT_ID = "61338d24-54d5-408f-a10d-66c06b59f6d2"
+PROJECTED_GRID_CRS = "EPSG:3031"
+GEOGRAPHIC_CRS = "EPSG:4326"
+LON_LAT_TO_X_Y = Transformer.from_crs(GEOGRAPHIC_CRS, PROJECTED_GRID_CRS, always_xy=True)
+X_Y_TO_LON_LAT = Transformer.from_crs(PROJECTED_GRID_CRS, GEOGRAPHIC_CRS, always_xy=True)
+TIME_UNITS_PATTERN = re.compile(r"^(?P<unit>\w+)\s+since\s+(?P<base>.+)$")
 
 
 @dataclass
 class Point:
     name: str
+    latitude: float
+    longitude: float
     x: float
     y: float
 
@@ -165,11 +178,102 @@ def decode_attr(value: Any) -> Any:
     return value
 
 
-def parse_points(config: dict[str, Any]) -> list[Point]:
-    raw_points = config["subset"]["points"]
-    points = [Point(name=item["name"], x=float(item["x"]), y=float(item["y"])) for item in raw_points]
+def normalize_longitude(longitude: float) -> float:
+    normalized = ((longitude + 180.0) % 360.0) - 180.0
+    if normalized == -180.0 and longitude > 0:
+        return 180.0
+    return normalized
+
+
+def parse_angular_coordinate(value: Any, coordinate_name: str) -> float:
+    if isinstance(value, (int, float, np.floating, np.integer)):
+        numeric = float(value)
+    elif isinstance(value, str):
+        text = value.strip().upper().replace(" ", "")
+        hemisphere = text[-1] if text and text[-1] in {"N", "S", "E", "W"} else None
+        if hemisphere:
+            text = text[:-1]
+        if not text:
+            raise ValueError(f"Invalid {coordinate_name} value: {value!r}")
+        explicit_sign = -1.0 if text.startswith("-") else 1.0
+        numeric = abs(float(text))
+        if hemisphere and not text.startswith(("-", "+")):
+            if hemisphere in {"S", "W"}:
+                explicit_sign = -1.0
+        numeric *= explicit_sign
+    else:
+        raise TypeError(f"Unsupported {coordinate_name} value type: {type(value)!r}")
+
+    if coordinate_name == "latitude" and not -90.0 <= numeric <= 90.0:
+        raise ValueError(f"Latitude must be between -90 and 90 degrees: {value!r}")
+    if coordinate_name == "longitude":
+        numeric = normalize_longitude(numeric)
+    return numeric
+
+
+def load_points_payload(points_file: Path) -> list[dict[str, Any]]:
+    with points_file.open() as f:
+        payload = json.load(f)
+    if isinstance(payload, dict):
+        payload = payload.get("points", [])
+    if not isinstance(payload, list):
+        raise ValueError(f"Point file must contain a list or an object with a 'points' list: {points_file}")
+    return payload
+
+
+def parse_point_definition(item: dict[str, Any], index: int) -> Point:
+    name = str(item.get("name") or f"point_{index}")
+
+    has_geographic = any(key in item for key in ("latitude", "lat")) and any(
+        key in item for key in ("longitude", "lon")
+    )
+    has_projected = "x" in item and "y" in item
+
+    if has_geographic:
+        latitude = parse_angular_coordinate(item.get("latitude", item.get("lat")), "latitude")
+        longitude = parse_angular_coordinate(item.get("longitude", item.get("lon")), "longitude")
+        x, y = LON_LAT_TO_X_Y.transform(longitude, latitude)
+    elif has_projected:
+        x = float(item["x"])
+        y = float(item["y"])
+        longitude, latitude = X_Y_TO_LON_LAT.transform(x, y)
+        longitude = normalize_longitude(float(longitude))
+        latitude = float(latitude)
+    else:
+        raise ValueError(
+            f"Point {name!r} must define either latitude/longitude or x/y coordinates. "
+            f"Received keys: {sorted(item.keys())}"
+        )
+
+    return Point(
+        name=name,
+        latitude=float(latitude),
+        longitude=float(longitude),
+        x=float(x),
+        y=float(y),
+    )
+
+
+def parse_points(config: dict[str, Any], config_path: Path) -> list[Point]:
+    subset_cfg = config["subset"]
+    raw_points: list[dict[str, Any]] = []
+
+    points_file = subset_cfg.get("points_file")
+    if points_file:
+        points_path = Path(points_file).expanduser()
+        if not points_path.is_absolute():
+            points_path = (config_path.parent / points_path).resolve()
+        raw_points.extend(load_points_payload(points_path))
+
+    inline_points = subset_cfg.get("points", [])
+    if inline_points:
+        if not isinstance(inline_points, list):
+            raise ValueError("subset.points must be a list when provided")
+        raw_points.extend(inline_points)
+
+    points = [parse_point_definition(item, index + 1) for index, item in enumerate(raw_points)]
     if not points:
-        raise ValueError("subset.points must contain at least one point")
+        raise ValueError("Provide at least one point via subset.points or subset.points_file")
     return points
 
 
@@ -201,16 +305,21 @@ def extract_points_from_file(
         if fill_value is not None:
             values[values >= float(fill_value) * 0.1] = np.nan
 
-        actual_x = x[ix]
-        actual_y = y[iy]
+        actual_x = x[ix].astype(np.float64)
+        actual_y = y[iy].astype(np.float64)
+        actual_longitude, actual_latitude = X_Y_TO_LON_LAT.transform(actual_x, actual_y)
 
     return {
         "time": np.asarray(time_values),
         "values": values,
         "requested_x": np.array([p.x for p in points], dtype=np.float64),
         "requested_y": np.array([p.y for p in points], dtype=np.float64),
-        "actual_x": actual_x.astype(np.float64),
-        "actual_y": actual_y.astype(np.float64),
+        "requested_latitude": np.array([p.latitude for p in points], dtype=np.float64),
+        "requested_longitude": np.array([p.longitude for p in points], dtype=np.float64),
+        "actual_x": actual_x,
+        "actual_y": actual_y,
+        "actual_latitude": np.asarray(actual_latitude, dtype=np.float64),
+        "actual_longitude": np.asarray([normalize_longitude(v) for v in actual_longitude], dtype=np.float64),
         "point_names": [p.name for p in points],
         "variable_attrs": variable_attrs,
         "time_attrs": time_attrs,
@@ -224,8 +333,12 @@ def write_output_netcdf(
     point_names: list[str],
     requested_x: np.ndarray,
     requested_y: np.ndarray,
+    requested_latitude: np.ndarray,
+    requested_longitude: np.ndarray,
     actual_x: np.ndarray,
     actual_y: np.ndarray,
+    actual_latitude: np.ndarray,
+    actual_longitude: np.ndarray,
     time_values: np.ndarray,
     values: np.ndarray,
     variable_attrs: dict[str, Any],
@@ -233,17 +346,26 @@ def write_output_netcdf(
     global_attrs: dict[str, Any],
     source_files: list[str],
 ) -> None:
+    if h5netcdf is None:
+        raise ModuleNotFoundError(
+            "h5netcdf is required to write the compact NetCDF output. "
+            "Install it or set output.path to null and rely on output.json_path."
+        )
+
     path.parent.mkdir(parents=True, exist_ok=True)
     string_dtype = h5py.string_dtype("utf-8")
 
     with h5netcdf.File(path, "w") as ds:
         ds.dimensions = {"time": len(time_values), "point": len(point_names)}
+
         for key, value in global_attrs.items():
             try:
                 ds.attrs[key] = value
             except (TypeError, ValueError, AttributeError):
                 pass
         ds.attrs["subset_method"] = "nearest_neighbour_on_projected_grid"
+        ds.attrs["subset_grid_crs"] = PROJECTED_GRID_CRS
+        ds.attrs["subset_input_crs"] = GEOGRAPHIC_CRS
         ds.attrs["subset_source_files"] = json.dumps(source_files)
 
         time_var = ds.create_variable("time", ("time",), data=time_values)
@@ -256,14 +378,33 @@ def write_output_netcdf(
         point_name_var = ds.create_variable("point_name", ("point",), dtype=string_dtype)
         point_name_var[:] = np.asarray(point_names, dtype=object)
 
+        lat_req_var = ds.create_variable("requested_latitude", ("point",), data=requested_latitude)
+        lat_req_var.attrs["units"] = "degrees_north"
+        lat_req_var.attrs["standard_name"] = "latitude"
+        lon_req_var = ds.create_variable("requested_longitude", ("point",), data=requested_longitude)
+        lon_req_var.attrs["units"] = "degrees_east"
+        lon_req_var.attrs["standard_name"] = "longitude"
+
         x_req_var = ds.create_variable("requested_x", ("point",), data=requested_x)
         x_req_var.attrs["units"] = "meter"
+        x_req_var.attrs["standard_name"] = "projection_x_coordinate"
         y_req_var = ds.create_variable("requested_y", ("point",), data=requested_y)
         y_req_var.attrs["units"] = "meter"
+        y_req_var.attrs["standard_name"] = "projection_y_coordinate"
+
         x_var = ds.create_variable("x", ("point",), data=actual_x)
         x_var.attrs["units"] = "meter"
+        x_var.attrs["standard_name"] = "projection_x_coordinate"
         y_var = ds.create_variable("y", ("point",), data=actual_y)
         y_var.attrs["units"] = "meter"
+        y_var.attrs["standard_name"] = "projection_y_coordinate"
+
+        lat_var = ds.create_variable("latitude", ("point",), data=actual_latitude)
+        lat_var.attrs["units"] = "degrees_north"
+        lat_var.attrs["standard_name"] = "latitude"
+        lon_var = ds.create_variable("longitude", ("point",), data=actual_longitude)
+        lon_var.attrs["units"] = "degrees_east"
+        lon_var.attrs["standard_name"] = "longitude"
 
         data_var = ds.create_variable(variable_name, ("time", "point"), data=values)
         for key, value in variable_attrs.items():
@@ -273,17 +414,120 @@ def write_output_netcdf(
                 data_var.attrs[key] = value
             except (TypeError, ValueError, AttributeError):
                 pass
-        data_var.attrs["coordinates"] = "time point_name x y requested_x requested_y"
+        data_var.attrs["coordinates"] = (
+            "time point_name latitude longitude x y "
+            "requested_latitude requested_longitude requested_x requested_y"
+        )
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return [_json_safe(item) for item in value.tolist()]
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        if np.isnan(value):
+            return None
+        return float(value)
+    if isinstance(value, float):
+        return None if np.isnan(value) else value
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return value
+
+
+def maybe_format_time_values(time_values: np.ndarray, time_attrs: dict[str, Any]) -> list[str] | None:
+    units = str(time_attrs.get("units", "")).strip()
+    match = TIME_UNITS_PATTERN.match(units)
+    if not match:
+        return None
+    if match.group("unit").lower() != "days":
+        return None
+
+    base_text = match.group("base").strip()
+    try:
+        base_time = datetime.fromisoformat(base_text)
+    except ValueError:
+        return None
+
+    return [(base_time + timedelta(days=float(day))).isoformat() for day in time_values]
+
+
+def write_output_json(
+    path: Path,
+    variable_name: str,
+    point_names: list[str],
+    requested_x: np.ndarray,
+    requested_y: np.ndarray,
+    requested_latitude: np.ndarray,
+    requested_longitude: np.ndarray,
+    actual_x: np.ndarray,
+    actual_y: np.ndarray,
+    actual_latitude: np.ndarray,
+    actual_longitude: np.ndarray,
+    time_values: np.ndarray,
+    values: np.ndarray,
+    variable_attrs: dict[str, Any],
+    time_attrs: dict[str, Any],
+    global_attrs: dict[str, Any],
+    source_files: list[str],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    time_iso8601 = maybe_format_time_values(time_values, time_attrs)
+    payload = {
+        "variable": variable_name,
+        "subset_method": "nearest_neighbour_on_projected_grid",
+        "projected_grid_crs": PROJECTED_GRID_CRS,
+        "input_coordinate_crs": GEOGRAPHIC_CRS,
+        "source_files": source_files,
+        "time": {
+            "values": _json_safe(time_values),
+            "attrs": _json_safe(time_attrs),
+            "iso8601": time_iso8601,
+        },
+        "variable_attrs": _json_safe(variable_attrs),
+        "global_attrs": _json_safe(global_attrs),
+        "points": [],
+    }
+
+    for index, name in enumerate(point_names):
+        payload["points"].append(
+            {
+                "name": name,
+                "requested": {
+                    "latitude_deg": _json_safe(requested_latitude[index]),
+                    "longitude_deg": _json_safe(requested_longitude[index]),
+                    "x_m": _json_safe(requested_x[index]),
+                    "y_m": _json_safe(requested_y[index]),
+                },
+                "actual": {
+                    "latitude_deg": _json_safe(actual_latitude[index]),
+                    "longitude_deg": _json_safe(actual_longitude[index]),
+                    "x_m": _json_safe(actual_x[index]),
+                    "y_m": _json_safe(actual_y[index]),
+                },
+                "values": _json_safe(values[:, index]),
+            }
+        )
+
+    with path.open("w") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
 
 
 def run_pipeline(config_path: Path, list_only: bool = False) -> None:
     config = load_config(config_path)
-    points = parse_points(config)
+    points = parse_points(config, config_path=config_path.resolve())
     app, transfer_client = build_transfer_client(config)
 
     source_cfg = config["source"]
     dest_cfg = config["destination"]
-    output_cfg = config["output"]
+    output_cfg = config.get("output", {})
     transfer_cfg = config.get("transfer", {})
     subset_cfg = config["subset"]
 
@@ -306,6 +550,13 @@ def run_pipeline(config_path: Path, list_only: bool = False) -> None:
     file_limit = transfer_cfg.get("limit_files")
     if file_limit:
         files = files[: int(file_limit)]
+
+    print(f"Configured {len(points)} target points")
+    for point in points:
+        print(
+            f"  - {point.name}: lat={point.latitude:.6f}, lon={point.longitude:.6f}, "
+            f"x={point.x:.1f}, y={point.y:.1f}"
+        )
 
     print(f"Found {len(files)} files in {remote_dir!r} matching {pattern!r}")
     for item in files:
@@ -377,31 +628,66 @@ def run_pipeline(config_path: Path, list_only: bool = False) -> None:
     if np.any(duplicate_times[1] > 1):
         raise RuntimeError("Duplicate time values were detected across input files; refine file selection first.")
 
-    output_path = Path(output_cfg["path"]).expanduser().resolve()
-    if output_path.exists() and not bool(output_cfg.get("overwrite", False)):
-        raise FileExistsError(f"Output file already exists: {output_path}")
+    output_path = output_cfg.get("path")
+    if output_path:
+        netcdf_output_path = Path(output_path).expanduser().resolve()
+        if netcdf_output_path.exists() and not bool(output_cfg.get("overwrite", False)):
+            raise FileExistsError(f"Output file already exists: {netcdf_output_path}")
+        if netcdf_output_path.exists():
+            netcdf_output_path.unlink()
+        write_output_netcdf(
+            netcdf_output_path,
+            variable_name=variable_name,
+            point_names=metadata["point_names"],
+            requested_x=metadata["requested_x"],
+            requested_y=metadata["requested_y"],
+            requested_latitude=metadata["requested_latitude"],
+            requested_longitude=metadata["requested_longitude"],
+            actual_x=metadata["actual_x"],
+            actual_y=metadata["actual_y"],
+            actual_latitude=metadata["actual_latitude"],
+            actual_longitude=metadata["actual_longitude"],
+            time_values=all_times,
+            values=all_values,
+            variable_attrs=metadata["variable_attrs"],
+            time_attrs=metadata["time_attrs"],
+            global_attrs=metadata["global_attrs"],
+            source_files=source_files,
+        )
+        print()
+        print(f"Wrote subset NetCDF: {netcdf_output_path}")
 
-    if output_path.exists():
-        output_path.unlink()
+    json_output_path = output_cfg.get("json_path")
+    if json_output_path:
+        reduced_json_path = Path(json_output_path).expanduser().resolve()
+        if reduced_json_path.exists() and not bool(output_cfg.get("overwrite", False)):
+            raise FileExistsError(f"Output file already exists: {reduced_json_path}")
+        if reduced_json_path.exists():
+            reduced_json_path.unlink()
+        write_output_json(
+            reduced_json_path,
+            variable_name=variable_name,
+            point_names=metadata["point_names"],
+            requested_x=metadata["requested_x"],
+            requested_y=metadata["requested_y"],
+            requested_latitude=metadata["requested_latitude"],
+            requested_longitude=metadata["requested_longitude"],
+            actual_x=metadata["actual_x"],
+            actual_y=metadata["actual_y"],
+            actual_latitude=metadata["actual_latitude"],
+            actual_longitude=metadata["actual_longitude"],
+            time_values=all_times,
+            values=all_values,
+            variable_attrs=metadata["variable_attrs"],
+            time_attrs=metadata["time_attrs"],
+            global_attrs=metadata["global_attrs"],
+            source_files=source_files,
+        )
+        print(f"Wrote subset JSON: {reduced_json_path}")
 
-    write_output_netcdf(
-        output_path,
-        variable_name=variable_name,
-        point_names=metadata["point_names"],
-        requested_x=metadata["requested_x"],
-        requested_y=metadata["requested_y"],
-        actual_x=metadata["actual_x"],
-        actual_y=metadata["actual_y"],
-        time_values=all_times,
-        values=all_values,
-        variable_attrs=metadata["variable_attrs"],
-        time_attrs=metadata["time_attrs"],
-        global_attrs=metadata["global_attrs"],
-        source_files=source_files,
-    )
+    if not output_path and not json_output_path:
+        raise ValueError("Configure at least one of output.path or output.json_path")
 
-    print()
-    print(f"Wrote subset file: {output_path}")
     print(f"Processed {len(source_files)} source files")
 
 
@@ -411,7 +697,10 @@ def print_parser_help(parser: argparse.ArgumentParser) -> None:
 
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Transfer ISMIP7 NetCDF files from Globus one at a time, subset points, and write a compact NetCDF."
+        description=(
+            "Transfer ISMIP7 NetCDF files from Globus one at a time, extract point time series, "
+            "and write compact local outputs."
+        )
     )
     parser.add_argument(
         "--config",
