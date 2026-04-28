@@ -1,0 +1,34 @@
+{
+  "points": [
+    {
+      "name": "Ross J9",
+      "latitude": "82.375S",
+      "longitude": -168.626
+    },
+    {
+      "name": "Amery G1",
+      "latitude": "69.451S",
+      "longitude": "71.497E"
+    },
+    {
+      "name": "PIG",
+      "latitude":"75.1S",
+      "longitude":"100.5W"
+    },
+    {
+      "name": "Larsen C",
+      "latitude":"68.0086S",
+      "longitude":"64.3675W"
+    },
+    {
+      "name": "Thwaites",
+      "latitude":"75.1S",
+      "longitude":"105.75W"
+    },
+    { 
+      "name": "Ronne",
+      "latitude": "79.5S",
+      "longitude": "58W"
+    }
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "globus_app": {
+    "app_name": "cesm2-ismip7-subsetter",
+    "client_id": "61338d24-54d5-408f-a10d-66c06b59f6d2"
+  },
+  "source": {
+    "local_dir": "../../downloaded_files",
+    "glob_pattern": "*.nc"
+  },
+  "destination": {
+    "collection_id": null,
+    "collection_path": null,
+    "local_staging_dir": null
+  },
+  "subset": {
+    "variable": "tas",
+    "points_file": "../points/temperature_points.json"
+  },
+  "output": {
+    "path": "../../output/ismip7_tas_point_subset_local.nc",
+    "json_path": "../../output/ismip7_tas_point_subset_local.json",
+    "overwrite": true
+  },
+  "transfer": {
+    "poll_interval_seconds": 10,
+    "task_timeout_seconds": 3600,
+    "delete_after_extract": false,
+    "limit_files": 3
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "globus_app": {
+    "app_name": "cesm2-ismip7-subsetter",
+    "client_id": "61338d24-54d5-408f-a10d-66c06b59f6d2"
+  },
+  "source": {
+    "collection_name": "GHub-upload",
+    "collection_id": null,
+    "path": "/ISMIP7/AIS/CESM2-WACCM/ssp126/SDBN1/tas/v2/",
+    "glob_pattern": "*.nc"
+  },
+  "destination": {
+    "collection_id": "966002a3-3f12-11f1-90eb-0afffe4617ab",
+    "collection_path": "/~/cesm2-ismip7-stage",
+    "local_staging_dir": "/home/bradlipovsky/cesm2-ismip7-stage"
+  },
+  "subset": {
+    "variable": "tas",
+    "points_file": "../points/temperature_points.json"
+  },
+  "output": {
+    "path": "../../output/ismip7_tas_point_subset_full.nc",
+    "json_path": "../../output/ismip7_tas_point_subset_full.json",
+    "overwrite": true
+  },
+  "transfer": {
+    "poll_interval_seconds": 10,
+    "task_timeout_seconds": 3600,
+    "delete_after_extract": true,
+    "limit_files": null
+  }
+}
