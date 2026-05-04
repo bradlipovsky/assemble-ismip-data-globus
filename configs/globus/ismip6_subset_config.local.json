@@ -1,0 +1,43 @@
+{
+  "globus_app": {
+    "app_name": "cesm2-ismip7-subsetter",
+    "client_id": "61338d24-54d5-408f-a10d-66c06b59f6d2"
+  },
+  "source": {
+    "collection_name": "GHub-ISMIP6-Projection-AIS",
+    "collection_id": "09cb49bb-12fd-44af-a0aa-11b31f31d3a5",
+    "root_path": "/"
+  },
+  "destination": {
+    "collection_id": "966002a3-3f12-11f1-90eb-0afffe4617ab",
+    "collection_path": "/~/cesm2-ismip7-stage/ismip6",
+    "local_staging_dir": "/home/bradlipovsky/cesm2-ismip7-stage/ismip6"
+  },
+  "subset": {
+    "points_file": "../points/temperature_points.json",
+    "point_set_name": "six_sites"
+  },
+  "variables": {
+    "ice_thickness": ["lithk"],
+    "basal_melt_rate": ["libmassbffl"],
+    "surface_mass_balance": ["acabf"],
+    "surface_temperature": ["litemptop"],
+    "vertical_velocity_surface": ["zvelsurf"],
+    "vertical_velocity_base": ["zvelbase"],
+    "ice_thickness_tendency": ["dlithkdt"],
+    "horizontal_velocity_surface_x": ["xvelsurf"],
+    "horizontal_velocity_surface_y": ["yvelsurf"],
+    "horizontal_velocity_base_x": ["xvelbase"],
+    "horizontal_velocity_base_y": ["yvelbase"]
+  },
+  "output": {
+    "root": "../../output/ismip6",
+    "overwrite": false
+  },
+  "transfer": {
+    "poll_interval_seconds": 1,
+    "task_timeout_seconds": 3600,
+    "delete_after_extract": true,
+    "batch_file_count": 96
+  }
+}

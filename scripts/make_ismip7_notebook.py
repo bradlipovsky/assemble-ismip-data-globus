@@ -2,7 +2,8 @@ import json
 from pathlib import Path
 
 
-NOTEBOOK_PATH = Path("cesm2_ismip7_forcing_exploration.ipynb")
+ROOT = Path(__file__).resolve().parents[1]
+NOTEBOOK_PATH = ROOT / "notebooks" / "cesm2_ismip7_forcing_exploration.ipynb"
 DATA_FILE = "tas_AIS_CESM2-WACCM_ssp126_SDBN1_v2_2015.nc"
 
 
@@ -380,6 +381,6 @@ notebook = {
     "nbformat_minor": 5,
 }
 
-
+NOTEBOOK_PATH.parent.mkdir(parents=True, exist_ok=True)
 NOTEBOOK_PATH.write_text(json.dumps(notebook, indent=2))
 print(f"Wrote {NOTEBOOK_PATH}")

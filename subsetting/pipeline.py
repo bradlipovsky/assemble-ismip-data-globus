@@ -41,6 +41,13 @@ class Point:
     y: float
 
 
+def resolve_path(path_value: str | Path, *, config_path: Path) -> Path:
+    path = Path(path_value).expanduser()
+    if not path.is_absolute():
+        path = (config_path.parent / path).resolve()
+    return path
+
+
 def load_config(path: Path) -> dict[str, Any]:
     with path.open() as f:
         return json.load(f)
@@ -91,7 +98,8 @@ def resolve_collection_id(
 def collection_uses_data_access(doc: dict[str, Any]) -> bool:
     entity_type = str(doc.get("entity_type", ""))
     high_assurance = bool(doc.get("high_assurance", False))
-    return entity_type.endswith("mapped_collection") and not high_assurance
+    advertised_scopes = doc.get("mapped_collection_data_access_scope") or doc.get("data_access_scope")
+    return entity_type.endswith("mapped_collection") and not high_assurance and bool(advertised_scopes)
 
 
 def maybe_add_data_access_consents(
@@ -104,7 +112,9 @@ def maybe_add_data_access_consents(
     for collection_id in (source_collection_id, destination_collection_id):
         doc = transfer_client.get_endpoint(collection_id)
         if collection_uses_data_access(doc):
-            extra_scopes.append(f"https://auth.globus.org/scopes/{collection_id}/data_access")
+            scope = doc.get("mapped_collection_data_access_scope") or doc.get("data_access_scope")
+            if scope:
+                extra_scopes.append(str(scope))
 
     if not extra_scopes:
         return transfer_client
@@ -129,6 +139,29 @@ def list_remote_files(
     ]
     files.sort(key=lambda item: item["name"])
     return files
+
+
+def list_local_files(source_cfg: dict[str, Any], config_path: Path) -> list[Path]:
+    local_files = source_cfg.get("local_files")
+    local_dir = source_cfg.get("local_dir")
+    pattern = source_cfg.get("glob_pattern", "*.nc")
+
+    if local_files and local_dir:
+        raise ValueError("Use either source.local_files or source.local_dir, not both")
+
+    if local_files:
+        if not isinstance(local_files, list):
+            raise ValueError("source.local_files must be a list when provided")
+        paths = []
+        for item in local_files:
+            paths.append(resolve_path(item, config_path=config_path))
+        return sorted(paths)
+
+    if local_dir:
+        local_dir_path = resolve_path(local_dir, config_path=config_path)
+        return sorted(path for path in local_dir_path.iterdir() if path.is_file() and fnmatch.fnmatch(path.name, pattern))
+
+    return []
 
 
 def submit_transfer_and_wait(
@@ -171,6 +204,8 @@ def submit_transfer_and_wait(
 
 
 def decode_attr(value: Any) -> Any:
+    if isinstance(value, h5py.Reference):
+        return None
     if isinstance(value, bytes):
         return value.decode("utf-8")
     if isinstance(value, np.ndarray) and value.shape == (1,):
@@ -260,9 +295,7 @@ def parse_points(config: dict[str, Any], config_path: Path) -> list[Point]:
 
     points_file = subset_cfg.get("points_file")
     if points_file:
-        points_path = Path(points_file).expanduser()
-        if not points_path.is_absolute():
-            points_path = (config_path.parent / points_path).resolve()
+        points_path = resolve_path(points_file, config_path=config_path)
         raw_points.extend(load_points_payload(points_path))
 
     inline_points = subset_cfg.get("points", [])
@@ -427,6 +460,12 @@ def _json_safe(value: Any) -> Any:
         return [_json_safe(item) for item in value]
     if isinstance(value, np.ndarray):
         return [_json_safe(item) for item in value.tolist()]
+    if isinstance(value, h5py.Reference):
+        return None
+    if isinstance(value, np.void):
+        if value.dtype.names:
+            return {name: _json_safe(value[name]) for name in value.dtype.names}
+        return _json_safe(value.tolist())
     if isinstance(value, (np.integer,)):
         return int(value)
     if isinstance(value, (np.floating,)):
@@ -523,30 +562,41 @@ def write_output_json(
 def run_pipeline(config_path: Path, list_only: bool = False) -> None:
     config = load_config(config_path)
     points = parse_points(config, config_path=config_path.resolve())
-    app, transfer_client = build_transfer_client(config)
 
     source_cfg = config["source"]
     dest_cfg = config["destination"]
     output_cfg = config.get("output", {})
     transfer_cfg = config.get("transfer", {})
     subset_cfg = config["subset"]
+    local_files = list_local_files(source_cfg, config_path=config_path.resolve())
+    use_local_files = bool(local_files)
 
-    source_collection_id = resolve_collection_id(
-        transfer_client,
-        source_cfg.get("collection_name"),
-        source_cfg.get("collection_id"),
-    )
-    destination_collection_id = dest_cfg["collection_id"]
-    transfer_client = maybe_add_data_access_consents(
-        app,
-        transfer_client,
-        source_collection_id,
-        destination_collection_id,
-    )
+    source_collection_id: str | None = None
+    destination_collection_id: str | None = None
+    remote_dir = source_cfg.get("path", "")
+    transfer_client: globus_sdk.TransferClient | None = None
 
-    pattern = source_cfg.get("glob_pattern", "*.nc")
-    remote_dir = source_cfg["path"]
-    files = list_remote_files(transfer_client, source_collection_id, remote_dir, pattern)
+    if not use_local_files:
+        app, transfer_client = build_transfer_client(config)
+        source_collection_id = resolve_collection_id(
+            transfer_client,
+            source_cfg.get("collection_name"),
+            source_cfg.get("collection_id"),
+        )
+        destination_collection_id = dest_cfg["collection_id"]
+        transfer_client = maybe_add_data_access_consents(
+            app,
+            transfer_client,
+            source_collection_id,
+            destination_collection_id,
+        )
+
+        pattern = source_cfg.get("glob_pattern", "*.nc")
+        remote_dir = source_cfg["path"]
+        files: list[dict[str, Any]] | list[Path] = list_remote_files(transfer_client, source_collection_id, remote_dir, pattern)
+    else:
+        files = local_files
+
     file_limit = transfer_cfg.get("limit_files")
     if file_limit:
         files = files[: int(file_limit)]
@@ -558,17 +608,24 @@ def run_pipeline(config_path: Path, list_only: bool = False) -> None:
             f"x={point.x:.1f}, y={point.y:.1f}"
         )
 
-    print(f"Found {len(files)} files in {remote_dir!r} matching {pattern!r}")
-    for item in files:
-        print(f"  - {item['name']}")
+    if use_local_files:
+        print(f"Found {len(files)} local files for processing")
+        for item in files:
+            print(f"  - {item}")
+    else:
+        print(f"Found {len(files)} files in {remote_dir!r} matching {pattern!r}")
+        for item in files:
+            print(f"  - {item['name']}")
     if list_only:
         return
     if not files:
         raise RuntimeError("No matching files found to process")
 
-    local_stage_dir = Path(dest_cfg["local_staging_dir"]).expanduser().resolve()
-    local_stage_dir.mkdir(parents=True, exist_ok=True)
-    remote_stage_dir = dest_cfg["collection_path"]
+    if not use_local_files:
+        local_stage_dir = resolve_path(dest_cfg["local_staging_dir"], config_path=config_path)
+        local_stage_dir.mkdir(parents=True, exist_ok=True)
+        remote_stage_dir = dest_cfg["collection_path"]
+
     timeout_seconds = int(transfer_cfg.get("task_timeout_seconds", 3600))
     poll_interval_seconds = int(transfer_cfg.get("poll_interval_seconds", 10))
     delete_after_extract = bool(transfer_cfg.get("delete_after_extract", True))
@@ -580,30 +637,39 @@ def run_pipeline(config_path: Path, list_only: bool = False) -> None:
     metadata: dict[str, Any] | None = None
 
     for item in files:
-        filename = item["name"]
-        remote_source_path = remote_dir.rstrip("/") + "/" + filename
-        remote_destination_path = remote_stage_dir.rstrip("/") + "/" + filename
-        local_path = local_stage_dir / filename
+        if use_local_files:
+            local_path = Path(item).resolve()
+            filename = local_path.name
+            if not local_path.exists():
+                raise FileNotFoundError(f"Configured local file does not exist: {local_path}")
+        else:
+            assert transfer_client is not None
+            assert source_collection_id is not None
+            assert destination_collection_id is not None
+            filename = item["name"]
+            remote_source_path = remote_dir.rstrip("/") + "/" + filename
+            remote_destination_path = remote_stage_dir.rstrip("/") + "/" + filename
+            local_path = local_stage_dir / filename
 
-        if local_path.exists():
-            local_path.unlink()
+            if local_path.exists():
+                local_path.unlink()
 
-        submit_transfer_and_wait(
-            transfer_client,
-            source_collection_id,
-            destination_collection_id,
-            remote_source_path,
-            remote_destination_path,
-            timeout_seconds=timeout_seconds,
-            poll_interval_seconds=poll_interval_seconds,
-        )
+            submit_transfer_and_wait(
+                transfer_client,
+                source_collection_id,
+                destination_collection_id,
+                remote_source_path,
+                remote_destination_path,
+                timeout_seconds=timeout_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+            )
 
-        wait_seconds = 0
-        while not local_path.exists():
-            if wait_seconds > 30:
-                raise RuntimeError(f"Transfer finished but local file did not appear: {local_path}")
-            time.sleep(1)
-            wait_seconds += 1
+            wait_seconds = 0
+            while not local_path.exists():
+                if wait_seconds > 30:
+                    raise RuntimeError(f"Transfer finished but local file did not appear: {local_path}")
+                time.sleep(1)
+                wait_seconds += 1
 
         extracted = extract_points_from_file(local_path, variable_name=variable_name, points=points)
         all_time_chunks.append(extracted["time"])
@@ -612,7 +678,7 @@ def run_pipeline(config_path: Path, list_only: bool = False) -> None:
         metadata = extracted
 
         print(f"Extracted {filename}: shape={extracted['values'].shape}")
-        if delete_after_extract:
+        if not use_local_files and delete_after_extract:
             local_path.unlink()
 
     if metadata is None:
@@ -630,7 +696,7 @@ def run_pipeline(config_path: Path, list_only: bool = False) -> None:
 
     output_path = output_cfg.get("path")
     if output_path:
-        netcdf_output_path = Path(output_path).expanduser().resolve()
+        netcdf_output_path = resolve_path(output_path, config_path=config_path)
         if netcdf_output_path.exists() and not bool(output_cfg.get("overwrite", False)):
             raise FileExistsError(f"Output file already exists: {netcdf_output_path}")
         if netcdf_output_path.exists():
@@ -659,7 +725,7 @@ def run_pipeline(config_path: Path, list_only: bool = False) -> None:
 
     json_output_path = output_cfg.get("json_path")
     if json_output_path:
-        reduced_json_path = Path(json_output_path).expanduser().resolve()
+        reduced_json_path = resolve_path(json_output_path, config_path=config_path)
         if reduced_json_path.exists() and not bool(output_cfg.get("overwrite", False)):
             raise FileExistsError(f"Output file already exists: {reduced_json_path}")
         if reduced_json_path.exists():
@@ -705,7 +771,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("globus_subset_config.sample.json"),
+        default=Path(__file__).resolve().parents[1] / "configs" / "globus" / "globus_subset_config.sample.json",
         help="Path to the JSON config file.",
     )
     parser.add_argument(

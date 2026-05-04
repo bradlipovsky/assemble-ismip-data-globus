@@ -1,0 +1,6 @@
+__pycache__/
+.codex-home/
+.codex-generated-configs/
+*.pyc
+output/
+scratch/
