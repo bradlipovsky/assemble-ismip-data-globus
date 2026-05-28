@@ -39,6 +39,14 @@ Run the additional requested subsets (`acabf`, `so`, `thetao`, `tf`, `melt_rate`
 python scripts/run_requested_subsets.py
 ```
 
+Run the ISMIP7 ocean thermal-forcing package for the temperature-profile points
+(`thetao`, `tf`, and `so`; OI climatology plus CESM2-WACCM SSP585 future
+windows):
+
+```bash
+python scripts/run_ismip7_ocean_thermal_forcing_subsets.py
+```
+
 Generate a generic inspection notebook for an output file:
 
 ```bash
@@ -80,6 +88,9 @@ The main local config is:
 - `tf`: [output/ismip7_tf_point_subset.nc](/home/bradlipovsky/notebooks/assemble-ismip-data-globus/output/ismip7_tf_point_subset.nc)
 - `so`: [output/ismip7_so_point_subset.nc](/home/bradlipovsky/notebooks/assemble-ismip-data-globus/output/ismip7_so_point_subset.nc)
 - `melt_rate`: [output/ismip7_melt_rate_point_subset.nc](/home/bradlipovsky/notebooks/assemble-ismip-data-globus/output/ismip7_melt_rate_point_subset.nc)
+- `thetao` ocean forcing package: [output/ismip7_cesm2_waccm_ocean_thetao_point_subset.nc](/home/bradlipovsky/notebooks/assemble-ismip-data-globus/output/ismip7_cesm2_waccm_ocean_thetao_point_subset.nc)
+- `tf` ocean forcing package: [output/ismip7_cesm2_waccm_ocean_tf_point_subset.nc](/home/bradlipovsky/notebooks/assemble-ismip-data-globus/output/ismip7_cesm2_waccm_ocean_tf_point_subset.nc)
+- `so` ocean forcing package: [output/ismip7_cesm2_waccm_ocean_so_point_subset.nc](/home/bradlipovsky/notebooks/assemble-ismip-data-globus/output/ismip7_cesm2_waccm_ocean_so_point_subset.nc)
 
 Inspection notebooks live alongside them in [notebooks](/home/bradlipovsky/notebooks/assemble-ismip-data-globus/notebooks).
 
